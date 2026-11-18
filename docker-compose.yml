@@ -5,6 +5,12 @@ name: dns-duty
 #   auth     -- local authoritative endpoint for the fixed domain (UDP 5354)
 #   resolver -- caching/serve-stale UDP resolver (UDP 5353, published)
 #   web      -- FastAPI operations console (HTTP 8000, published)
+#
+# Answer authentication uses one shared HMAC-SHA256 key.  If DNS_HMAC_KEY is
+# not set, the key is generated once into /data/hmac.key on the shared volume,
+# so auth and the resolver always agree and a restart reuses the same key.
+# To pin your own key instead, set DNS_HMAC_KEY (and optionally
+# DNS_HMAC_KEY_ID) in the environment of all three services.
 
 services:
   auth:
@@ -14,6 +20,9 @@ services:
       DB_PATH: /data/app.db
       FIXED_DOMAIN: service.example
       AUTH_PORT: "5354"
+      HMAC_KEY_FILE: /data/hmac.key
+      # DNS_HMAC_KEY: "change-me-in-production"   # optional explicit key
+      # DNS_HMAC_KEY_ID: "k1"
     volumes:
       - dnsdata:/data
     restart: unless-stopped
@@ -24,6 +33,7 @@ services:
     environment:
       DB_PATH: /data/app.db
       FIXED_DOMAIN: service.example
+      HMAC_KEY_FILE: /data/hmac.key
       RESOLVER_PORT: "5353"
       AUTH_HOST: auth
       AUTH_PORT: "5354"
@@ -44,6 +54,7 @@ services:
     environment:
       DB_PATH: /data/app.db
       FIXED_DOMAIN: service.example
+      HMAC_KEY_FILE: /data/hmac.key
       WEB_PORT: "8000"
       RESOLVER_HOST: resolver
       RESOLVER_PORT: "5353"

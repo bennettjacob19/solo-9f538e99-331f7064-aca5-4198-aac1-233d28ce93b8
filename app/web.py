@@ -2,7 +2,8 @@
 
 Serves a single-page console that can
   * switch the authoritative endpoint's behaviour for the fixed domain
-    (A record / NXDOMAIN / delayed A / timeout),
+    (A record / NXDOMAIN / delayed A / timeout) and its answer-auth mode
+    (valid signature / bad signature / unsigned),
   * fire a real DNS query at the resolver and show the actual reply together
     with where it came from (upstream / cache-fresh / cache-stale / none),
   * show the resolver cache state (with live countdowns) and the query logs
@@ -65,7 +66,16 @@ PAGE = """<!doctype html>
     &nbsp; <button onclick="applyMode()">应用</button>
     <span id="modemsg"></span>
   </p>
-  <p class="muted">当前权威端模式：<b id="curmode">…</b>（每 2 秒自动刷新）</p>
+  <p>
+    应答签名：
+    <label><input type="radio" name="authstate" value="ok"> 正确签名</label>
+    <label><input type="radio" name="authstate" value="badsig"> 错误签名（内容被篡改）</label>
+    <label><input type="radio" name="authstate" value="noauth"> 缺失签名</label>
+  </p>
+  <p class="muted">当前权威端模式：<b id="curmode">…</b>；签名状态：<b id="curauth">…</b>
+    （每 2 秒自动刷新）<br>
+    共享密钥：kid=<b id="kid">…</b>，指纹 <code id="kfp">…</code>
+    （密钥本身不会显示；重启后复用同一密钥文件）</p>
 </section>
 
 <section>
@@ -84,7 +94,7 @@ PAGE = """<!doctype html>
 <section>
   <h2>4. 解析器查询日志（最近 15 条）</h2>
   <table id="rlog"><thead><tr>
-    <th>时间</th><th>名称</th><th>类型</th><th>来源</th><th>RCODE</th><th>答复</th><th>说明</th>
+    <th>时间</th><th>名称</th><th>类型</th><th>来源</th><th>认证</th><th>RCODE</th><th>答复</th><th>说明</th>
   </tr></thead><tbody></tbody></table>
 </section>
 
@@ -117,13 +127,19 @@ async function refresh() {
       ` · 上游超时 ${s.params.upstream_timeout}s`;
     const c = s.control;
     if (c) {
+      const as = c.auth_state || 'ok';
       document.getElementById('curmode').textContent =
         `${c.mode}（A=${c.ip}，延迟=${c.delay_seconds}s，更新于 ${fmtTs(c.updated_at)}）`;
+      document.getElementById('curauth').textContent =
+        as === 'ok' ? '正确签名' : (as === 'badsig' ? '错误签名' : '缺失签名');
       document.querySelector(`input[name=mode][value=${c.mode}]`).checked = true;
+      document.querySelector(`input[name=authstate][value=${as}]`).checked = true;
       if (document.activeElement.id !== 'ip') document.getElementById('ip').value = c.ip;
       if (document.activeElement.id !== 'delay')
         document.getElementById('delay').value = c.delay_seconds;
     }
+    document.getElementById('kid').textContent = s.auth.key_id;
+    document.getElementById('kfp').textContent = s.auth.fingerprint;
     const k = s.cache;
     document.getElementById('cache').innerHTML = k ?
       `<span class="pill">rcode=${k.rcode}</span>` +
@@ -134,10 +150,17 @@ async function refresh() {
       (k.nx_confirmed_at ? `<span class="pill">NXDOMAIN 确认于 ${fmtTs(k.nx_confirmed_at)}</span>` : '')
       : '<span class="muted">（缓存为空）</span>';
     fillLog('rlog', s.resolver_log, r =>
-      [fmtTs(r.ts), r.qname, r.qtype, r.source, r.rcode, r.answers, r.detail]);
+      [fmtTs(r.ts), r.qname, r.qtype, r.source, authBadge(r.auth),
+       r.rcode, r.answers, r.detail]);
     fillLog('alog', s.auth_log, r =>
       [fmtTs(r.ts), r.qname, r.qtype, r.mode, r.action, r.detail]);
   } catch (e) { console.log(e); }
+}
+
+function authBadge(a) {
+  if (!a) return '<span class="muted">—</span>';
+  if (a === 'ok') return '<span class="ok">ok</span>';
+  return `<span class="bad">${a}</span>`;
 }
 
 function fillLog(id, rows, cols) {
@@ -148,7 +171,9 @@ function fillLog(id, rows, cols) {
 
 async function applyMode() {
   const mode = document.querySelector('input[name=mode]:checked').value;
-  const body = { mode, ip: document.getElementById('ip').value,
+  const auth_state =
+    document.querySelector('input[name=authstate]:checked').value;
+  const body = { mode, auth_state, ip: document.getElementById('ip').value,
                  delay_seconds: parseFloat(document.getElementById('delay').value) };
   const r = await (await fetch('/api/mode', { method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })).json();
@@ -167,6 +192,7 @@ async function doQuery() {
     : '（无应答记录）';
   el.innerHTML = `<p><b>${r.rcode}</b> &nbsp; ${ans} &nbsp; ` +
     `<span class="pill">来源：${r.source}</span> ` +
+    `<span class="pill">应答认证：${authBadge(r.auth)}</span> ` +
     `<span class="muted">${r.elapsed_ms}ms · ${r.meta.join(' ')}</span></p>`;
   const raw = document.getElementById('qraw');
   raw.style.display = 'block';
@@ -186,6 +212,7 @@ class ModeIn(BaseModel):
     mode: str
     ip: str | None = None
     delay_seconds: float | None = None
+    auth_state: str | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -203,6 +230,11 @@ def state() -> dict:
             "stale_window": common.STALE_WINDOW,
             "upstream_timeout": common.UPSTREAM_TIMEOUT,
         },
+        "auth": {
+            "key_id": common.HMAC_KEY_ID,
+            "fingerprint": common.hmac_key_fingerprint(),
+            "algorithm": "HMAC-SHA256",
+        },
         "control": common.get_control(),
         "cache": common.get_cache(),
         "resolver_log": common.recent("query_log"),
@@ -214,23 +246,33 @@ def state() -> dict:
 def set_mode(m: ModeIn):
     if m.mode not in ("a", "nxdomain", "delay", "timeout"):
         return JSONResponse({"ok": False, "error": f"unknown mode {m.mode!r}"}, 400)
+    if m.auth_state is not None and m.auth_state not in ("ok", "badsig", "noauth"):
+        return JSONResponse(
+            {"ok": False, "error": f"unknown auth_state {m.auth_state!r}"}, 400)
     cur = common.get_control() or {"ip": common.DEFAULT_IP,
-                                   "delay_seconds": common.DEFAULT_DELAY}
+                                   "delay_seconds": common.DEFAULT_DELAY,
+                                   "auth_state": "ok"}
     ip = m.ip if m.ip is not None else cur["ip"]
     delay = m.delay_seconds if m.delay_seconds is not None else cur["delay_seconds"]
+    auth_state = (m.auth_state if m.auth_state is not None
+                  else cur.get("auth_state") or "ok")
     try:
         ipaddress.IPv4Address(ip)
     except ValueError:
         return JSONResponse({"ok": False, "error": f"bad IPv4 address {ip!r}"}, 400)
     if not (0 <= float(delay) <= 60):
         return JSONResponse({"ok": False, "error": "delay must be 0..60s"}, 400)
-    common.set_control(m.mode, ip, float(delay))
+    common.set_control(m.mode, ip, float(delay), auth_state)
     return {"ok": True, "control": common.get_control()}
 
 
 @app.post("/api/query")
 def do_query() -> dict:
-    """Fire a real A query at the resolver and report the actual reply."""
+    """Fire a real A query at the resolver and report the actual reply.
+
+    This is a real client query: it goes over UDP to the resolver, which may
+    answer from its cache or perform (and authenticate) an upstream fetch.
+    """
     query = DNSRecord.question(common.FQDN, "A")
     t0 = time.time()
     try:
@@ -249,11 +291,17 @@ def do_query() -> dict:
         (t.split("=", 1)[1].split()[0] for t in txts if t.startswith("source=")),
         "unknown",
     )
+    auth = next(
+        (tok.split("=", 1)[1]
+         for t in txts for tok in t.split() if tok.startswith("auth=")),
+        "",
+    )
     return {
         "ok": True,
         "rcode": RCODE[rep.header.rcode],
         "answers": answers,
         "source": source,
+        "auth": auth,
         "meta": txts,
         "elapsed_ms": int((time.time() - t0) * 1000),
         "raw": str(rep),
